@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List
 import argparse
+import logging
 import pyjson5
 import os
 import pytest
@@ -109,8 +110,9 @@ def pytest_sessionstart(session):
 
 
 def pytest_collect_file(parent, file_path):
-    if (not file_path.name.endswith("_spec.mlir") 
-        and (file_path.name.endswith(".mlir") or file_path.name.endswith(".mlirbc"))):
+    if not file_path.name.endswith("_spec.mlir") and (
+        file_path.name.endswith(".mlir") or file_path.name.endswith(".mlirbc")
+    ):
         return MlirFile.from_parent(parent, path=file_path)
 
 # --------------------------------------------------------------------------- #
@@ -320,6 +322,10 @@ class IreeCompileRunItem(pytest.Item):
         self.run_args.append(f"--flagfile={self.spec.data_flagfile_name}")
 
     def runtest(self):
+        # TODO(scotttodd): log files needed by the test (remote files / git LFS)
+        #     it should be easy to copy/paste commands from CI logs to get both
+        #     the test files and the flags used with them
+
         # We want to test two phases: 'compile', and 'run'.
         # A test can be marked as expected to fail at either stage, with these
         # possible outcomes:
@@ -375,12 +381,35 @@ class IreeCompileRunItem(pytest.Item):
             raise e
 
     def test_compile(self):
-        proc = subprocess.run(self.compile_args, capture_output=True, cwd=self.test_cwd)
+        compile_env = os.environ.copy()
+        compile_env["IREE_TEST_PATH_EXTENSION"] = os.getenv(
+            "IREE_TEST_PATH_EXTENSION", default=str(self.test_cwd)
+        )
+        path_extension = compile_env["IREE_TEST_PATH_EXTENSION"]
+        cmd = subprocess.list2cmdline(self.compile_args)
+        cmd = cmd.replace("${IREE_TEST_PATH_EXTENSION}", f"{path_extension}")
+
+        # TODO(scotttodd): expand flagfile(s)
+        logging.getLogger().info(
+            f"Launching compile command:\n"  #
+            f"cd {self.test_cwd} && {cmd}"
+        )
+
+        proc = subprocess.run(cmd, env=compile_env, shell=True, capture_output=True, cwd=self.test_cwd)
         if proc.returncode != 0:
             raise IreeCompileException(proc, self.test_cwd)
 
     def test_run(self):
-        proc = subprocess.run(self.run_args, capture_output=True, cwd=self.test_cwd)
+        run_env = os.environ.copy()
+        cmd = subprocess.list2cmdline(self.run_args)
+
+        # TODO(scotttodd): expand flagfile(s)
+        logging.getLogger().info(
+            f"Launching run command:\n"  #
+            f"cd {self.test_cwd} && {cmd}"
+        )
+
+        proc = subprocess.run(cmd, env=run_env, shell=True, capture_output=True, cwd=self.test_cwd)
         if proc.returncode != 0:
             raise IreeRunException(proc, self.test_cwd, self.compile_args)
 
@@ -418,7 +447,7 @@ class IreeCompileException(Exception):
             f"Error code: {process.returncode}\n"
             f"Stderr diagnostics:\n{errs}\n\n"
             f"Invoked with:\n"
-            f"  cd {cwd} && {' '.join(process.args)}\n\n"
+            f"  cd {cwd} && {process.args}\n\n"
         )
 
 
@@ -438,15 +467,19 @@ class IreeRunException(Exception):
         except:
             outs = str(process.stdout)  # Decode error or other: best we can do.
 
+        compile_cmd = subprocess.list2cmdline(compile_args)
+        common_files_path = os.getenv("IREE_TEST_PATH_EXTENSION", default=cwd)
+        compile_cmd = compile_cmd.replace("${IREE_TEST_PATH_EXTENSION}", f"{common_files_path}")
+
         super().__init__(
             f"Error invoking iree-run-module\n"
             f"Error code: {process.returncode}\n"
             f"Stderr diagnostics:\n{errs}\n"
             f"Stdout diagnostics:\n{outs}\n"
             f"Compiled with:\n"
-            f"  cd {cwd} && {' '.join(compile_args)}\n\n"
+            f"  cd {cwd} && {compile_cmd}\n\n"
             f"Run with:\n"
-            f"  cd {cwd} && {' '.join(process.args)}\n\n"
+            f"  cd {cwd} && {process.args}\n\n"
         )
 
 
